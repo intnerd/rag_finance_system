@@ -1,8 +1,6 @@
 import os
-import time
 import uuid
-from pathlib import Path as _StdPath
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -14,10 +12,7 @@ from pymilvus import (
 )
 from pymilvus.milvus_client.index import IndexParams
 
-# src/vector_store.py → rag_finance_system/.env
-# 注意：不要设置 MILVUS_URI 环境变量，pymilvus 导入时会自动解析它。
-# 使用 MILVUS_LOCAL_DB 作为本地 .db 文件路径（仅 MilvusClient 读取）。
-load_dotenv(dotenv_path=str(_StdPath(__file__).resolve().parent.parent / ".env"))
+load_dotenv()
 
 COLLECTION_NAME = os.getenv("MILVUS_COLLECTION_NAME", "finance_regulations")
 DEFAULT_TEXT_MAX_LENGTH = 4096
@@ -26,7 +21,7 @@ DEFAULT_TEXT_MAX_LENGTH = 4096
 class VectorStore:
     def __init__(self):
         self.collection_name = COLLECTION_NAME
-        local_db = os.getenv("MILVUS_LOCAL_DB", "")
+        uri = os.getenv("MILVUS_URI", "")
         host = os.getenv("MILVUS_HOST", "127.0.0.1")
         port = os.getenv("MILVUS_PORT", "19530")
         user = os.getenv("MILVUS_USER", "")
@@ -34,11 +29,9 @@ class VectorStore:
         db_name = os.getenv("MILVUS_DB_NAME", "")
         self.embed_dim = self._read_embed_dim()
         self._index_type: Optional[str] = None
+        self._schema_fields: set = set()
 
-        # .db 本地文件 → POSIX 绝对路径；否则用 HTTP 连接
-        if local_db:
-            uri = _StdPath(local_db).resolve().as_posix()
-        else:
+        if not uri:
             uri = f"http://{host}:{port}"
 
         self.client = self._connect(uri, user, password, db_name)
@@ -76,9 +69,18 @@ class VectorStore:
         if self.client.has_collection(self.collection_name):
             self.client.load_collection(self.collection_name)
             self._index_type = self._detect_index_type()
+            self._cache_schema_fields()
             logger.info(f"已加载 Milvus collection: {self.collection_name}")
         else:
             logger.info(f"Milvus collection 不存在，将在首次写入时创建: {self.collection_name}")
+
+    def _cache_schema_fields(self):
+        """缓存当前 collection 的字段名，用于向后兼容旧 schema。"""
+        try:
+            desc = self.client.describe_collection(self.collection_name)
+            self._schema_fields = {f["name"] for f in desc.get("fields", [])}
+        except Exception:
+            self._schema_fields = set()
 
     def _detect_index_type(self) -> Optional[str]:
         try:
@@ -201,7 +203,7 @@ class VectorStore:
             "authority": authority_filter,
             "status": status_filter,
         }.items():
-            if value:
+            if value and key in self._schema_fields:
                 clauses.append(f'{key} == "{self._escape_expr_value(str(value))}"')
         return " and ".join(clauses) if clauses else ""
 
@@ -212,39 +214,6 @@ class VectorStore:
         if -1.0 <= raw_score <= 1.0:
             return round((raw_score + 1.0) / 2.0, 4)
         return round(max(0.0, min(1.0, 1.0 - raw_score / 2.0)), 4)
-
-    @staticmethod
-    def _retry_operation(op, *args, max_retries: int = 5, operation_name: str = "", **kwargs):
-        """带退避的重试，处理 milvus-lite 在 Windows 下的文件锁冲突。"""
-        last_exc = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                return op(*args, **kwargs)
-            except Exception as e:
-                last_exc = e
-                if attempt < max_retries:
-                    wait = 0.5 * (2 ** attempt)  # 1s, 2s, 4s, 8s
-                    logger.warning(f"Milvus {operation_name} 失败 (attempt {attempt}/{max_retries})，"
-                                   f"{wait:.1f}s 后重试: {e}")
-                    time.sleep(wait)
-        raise last_exc
-
-    def _insert_batch(self, data: list):
-        """带重试的单批插入。"""
-        return self._retry_operation(
-            self.client.insert,
-            collection_name=self.collection_name,
-            data=data,
-            operation_name="insert",
-        )
-
-    def _flush_with_retry(self):
-        """带重试的 flush。"""
-        return self._retry_operation(
-            self.client.flush,
-            self.collection_name,
-            operation_name="flush",
-        )
 
     def insert(
         self,
@@ -266,7 +235,7 @@ class VectorStore:
             batch_embeddings = embeddings[i:i + batch_size]
 
             data = []
-            for chunk, emb in zip(batch_chunks, batch_embeddings):
+            for chunk, emb in zip(batch_chunks, batch_embeddings, strict=True):
                 data.append({
                     "id": str(uuid.uuid4()),
                     "embedding": emb,
@@ -283,11 +252,11 @@ class VectorStore:
                     "status": self._clean_text(chunk.get("status", "有效"), 8),
                 })
 
-            self._insert_batch(data=data)
+            self.client.insert(collection_name=self.collection_name, data=data)
             inserted += len(batch_chunks)
             logger.info(f"已插入 {inserted}/{total}")
 
-        self._flush_with_retry()
+        self.client.flush(self.collection_name)
         self.client.load_collection(self.collection_name)
         return inserted
 
@@ -316,16 +285,12 @@ class VectorStore:
 
         search_params = self._get_search_params()
         output_fields = [
-            "text",
-            "source",
-            "chunk_id",
-            "article_num",
-            "file_path",
-            "chunk_index",
-            "doc_type",
-            "law_name",
-            "authority",
+            "text", "source", "chunk_id", "article_num", "file_path",
+            "chunk_index", "doc_type", "law_name", "authority",
         ]
+        for opt_field in ("effective_date", "status"):
+            if opt_field in self._schema_fields:
+                output_fields.append(opt_field)
 
         results = self.client.search(
             collection_name=self.collection_name,
@@ -353,6 +318,8 @@ class VectorStore:
                     "doc_type": entity.get("doc_type", "law"),
                     "law_name": entity.get("law_name", ""),
                     "authority": entity.get("authority", ""),
+                    "effective_date": entity.get("effective_date", ""),
+                    "status": entity.get("status", "有效"),
                 })
 
         return hits
