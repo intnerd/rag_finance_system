@@ -31,6 +31,9 @@ from rag_finance_system.api_schemas import (  # noqa: E402
     DictionaryItem,
     DictionaryItemList,
     DocumentInfo,
+    FlowchartImageRequest,
+    FlowchartResponse,
+    FlowchartTextRequest,
     IndexRequest,
     IndexResponse,
     QARequest,
@@ -71,6 +74,9 @@ _graph_builder = None
 # 术语倒排索引单例
 _term_index = None
 _term_index_path = str(Path(__file__).resolve().parent / "data" / "term_index.pkl")
+
+# 流程图生成器单例
+_flowchart_gen = None
 
 from rag_finance_system.src.document_processor import SUPPORTED_IMAGE_EXTENSIONS  # noqa: E402
 
@@ -157,6 +163,34 @@ def _get_processor():
         from rag_finance_system.src.document_processor import DocumentProcessor
         _processor = DocumentProcessor()
     return _processor
+
+
+def _get_flowchart_gen():
+    global _flowchart_gen
+    if _flowchart_gen is None:
+        from rag_finance_system.src.flowchart_generator import FlowchartGenerator
+        from rag_finance_system.src.llm import get_llm, get_multimodal_llm
+
+        multimodal_llm = None
+        try:
+            multimodal_llm = get_multimodal_llm()
+            logger.info("流程图生成器: 多模态 LLM 就绪")
+        except Exception as e:
+            logger.warning(f"多模态 LLM 不可用（将回退 OCR 路径）: {e}")
+
+        text_llm = None
+        try:
+            text_llm = get_llm(prefer_local=False)
+            logger.info("流程图生成器: 文本 LLM 就绪")
+        except Exception as e:
+            logger.warning(f"文本 LLM 不可用: {e}")
+
+        _flowchart_gen = FlowchartGenerator(
+            multimodal_llm=multimodal_llm,
+            text_llm=text_llm,
+            ocr_processor=_get_processor(),
+        )
+    return _flowchart_gen
 
 
 def _resolve_single_file_status(chunks: list, existing_law_names: set) -> list:
@@ -656,3 +690,31 @@ def list_laws():
         raise HTTPException(503, "Neo4j 知识图谱服务不可用")
     law_names = kg.get_distinct_law_names()
     return {"law_names": law_names, "count": len(law_names)}
+
+
+# ── 7. 流程图生成 ──
+
+@app.post("/api/flowchart/image", response_model=FlowchartResponse)
+def flowchart_from_image(body: FlowchartImageRequest):
+    """从图片生成 Mermaid 流程图。
+
+    优先使用多模态 LLM 直接理解图片（路径A），失败时回退 OCR+文本 LLM（路径B）。
+    """
+    gen = _get_flowchart_gen()
+
+    if body.prefer_multimodal and gen.multimodal_llm is not None:
+        result = gen.generate_from_image(image_base64=body.image_base64)
+    else:
+        result = gen.generate_from_image_via_ocr(image_base64=body.image_base64)
+
+    return FlowchartResponse(**result)
+
+
+@app.post("/api/flowchart/text", response_model=FlowchartResponse)
+def flowchart_from_text(body: FlowchartTextRequest):
+    """从法规文本生成 Mermaid 流程图。"""
+    gen = _get_flowchart_gen()
+
+    result = gen.generate_from_text(body.text)
+
+    return FlowchartResponse(**result)

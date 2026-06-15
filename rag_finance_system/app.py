@@ -6,11 +6,13 @@ Streamlit 前端 — 金融制度 RAG 问答系统
 
 import json
 import os
+import base64
 from pathlib import Path
 from typing import Generator
 
 import requests
 import streamlit as st
+from streamlit.components.v1 import html
 from requests.exceptions import ConnectionError, RequestException, Timeout
 
 DEFAULT_API_URL = os.environ.get("RAG_API_URL", "http://localhost:8000")
@@ -242,6 +244,55 @@ def query_article_relations(api_base: str, law_name: str, article_num: str) -> d
     return resp.json()
 
 
+# ── 流程图 Helper ──
+
+def flowchart_from_image_api(api_base: str, image_base64: str, prefer_multimodal: bool = True) -> dict:
+    """调用 POST /api/flowchart/image 从图片生成流程图。"""
+    resp = requests.post(
+        f"{api_base}/api/flowchart/image",
+        json={"image_base64": image_base64, "prefer_multimodal": prefer_multimodal},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def flowchart_from_text_api(api_base: str, text: str) -> dict:
+    """调用 POST /api/flowchart/text 从文本生成流程图。"""
+    resp = requests.post(
+        f"{api_base}/api/flowchart/text",
+        json={"text": text},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def render_mermaid(mermaid_str: str, height: int = 600):
+    """用 Mermaid.js CDN 在 Streamlit 中渲染流程图。"""
+    escaped = mermaid_str.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {{ margin: 0; padding: 20px; background: white; }}
+        .mermaid {{ font-family: sans-serif; }}
+    </style>
+</head>
+<body>
+    <div class="mermaid">
+{escaped}
+    </div>
+    <script>
+        mermaid.initialize({{ startOnLoad: true, theme: 'default', flowchart: {{ useMaxWidth: true, htmlLabels: true, curve: 'basis' }} }});
+    </script>
+</body>
+</html>"""
+    html(html_content, height=height)
+
+
 # ===== 侧边栏 =====
 with st.sidebar:
     st.title("⚙️ 系统设置")
@@ -299,6 +350,8 @@ with st.sidebar:
 
     if uploaded_file and Path(uploaded_file.name).suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}:
         st.info("图片将通过 OCR 自动识别文字内容后建立索引，处理时间约 10-30 秒/张")
+        gen_flowchart = st.checkbox("同时生成流程图", value=False,
+                                    help="索引完成后自动从图片识别流程步骤并生成 Mermaid 流程图")
 
     if uploaded_file:
         if st.button("解析并建立索引", type="primary", disabled=not st.session_state.api_ok):
@@ -314,8 +367,25 @@ with st.sidebar:
                 with st.spinner("正在建立索引（大文件需数分钟）..."):
                     index_resp = index_file(api_base, file_path, doc_type)
                 st.success(f"索引建立完成！共 {index_resp['chunk_count']} 个知识片段")
+
+                # 如果用户勾选了同时生成流程图
+                is_image = Path(uploaded_file.name).suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+                if is_image and gen_flowchart:
+                    with st.spinner("正在生成流程图..."):
+                        img_base64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
+                        flow_result = flowchart_from_image_api(api_base, img_base64, prefer_multimodal=True)
+                    if flow_result.get("success"):
+                        st.markdown("### 📊 流程图")
+                        render_mermaid(flow_result["mermaid"], height=500)
+                        with st.expander("查看 Mermaid 源码"):
+                            st.code(flow_result["mermaid"], language="mermaid")
+                    else:
+                        st.info(f"流程图生成: {flow_result.get('error', '未能识别流程步骤')}")
             except RequestException as e:
                 st.error(_handle_api_error(e))
+
+        else:
+            gen_flowchart = False  # 非图片文件不显示流程图选项
 
     st.divider()
     st.subheader("批量导入")
@@ -359,7 +429,7 @@ with st.sidebar:
 st.title("📚 金融制度知识问答系统")
 st.caption("基于 RAG 的金融法规智能问答 | bge-small-zh-v1.5 + Qwen2.5")
 
-tab_qa, tab_relations, tab_categories = st.tabs(["💬 智能问答", "🔗 条文关联查询", "🏷️ 标签分类管理"])
+tab_qa, tab_relations, tab_categories, tab_flowchart = st.tabs(["💬 智能问答", "🔗 条文关联查询", "🏷️ 标签分类管理", "🔄 流程图生成"])
 
 # ── Tab 1: 智能问答 ──
 with tab_qa:
@@ -683,3 +753,141 @@ with tab_categories:
                                         st.error(_handle_api_error(e))
             else:
                 st.info(f"暂无{selected_item_type}类型的条目")
+
+# ── Tab 4: 流程图生成 ──
+with tab_flowchart:
+    st.subheader("🔄 流程图生成")
+    st.caption("从图片或文本中识别流程步骤，自动生成 Mermaid 流程图")
+
+    # 初始化 session state
+    if "flowchart_mermaid" not in st.session_state:
+        st.session_state.flowchart_mermaid = ""
+    if "flowchart_source" not in st.session_state:
+        st.session_state.flowchart_source = ""
+    if "flowchart_error" not in st.session_state:
+        st.session_state.flowchart_error = None
+
+    # ── 输入方式选择 ──
+    input_mode = st.radio(
+        "输入方式",
+        options=["图片上传", "文本输入"],
+        horizontal=True,
+        key="flowchart_input_mode",
+    )
+
+    if input_mode == "图片上传":
+        # ── 图片上传 ──
+        flowchart_image = st.file_uploader(
+            "上传流程图片",
+            type=["png", "jpg", "jpeg", "bmp", "tiff", "webp"],
+            key="flowchart_image_uploader",
+            help="上传包含流程/步骤描述的图片，支持法规截图、流程示意图等",
+        )
+
+        if flowchart_image:
+            st.image(flowchart_image, caption="已上传图片", use_container_width=True)
+
+        # ── 路径选择 ──
+        path_mode = st.radio(
+            "生成路径",
+            options=["自动（优先多模态）", "仅 OCR + 文本 LLM", "仅多模态"],
+            horizontal=True,
+            key="flowchart_path_mode",
+        )
+        prefer_multimodal_map = {
+            "自动（优先多模态）": True,
+            "仅 OCR + 文本 LLM": False,
+            "仅多模态": True,
+        }
+        prefer_multimodal = prefer_multimodal_map[path_mode]
+
+        generate_btn = st.button(
+            "生成流程图",
+            type="primary",
+            disabled=not st.session_state.api_ok or flowchart_image is None,
+            key="flowchart_generate_btn",
+        )
+
+        if generate_btn and flowchart_image:
+            # 将图片编码为 base64
+            img_bytes = flowchart_image.getvalue()
+            img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+
+            with st.spinner("正在生成流程图（多模态 LLM 或 OCR + 文本 LLM）..."):
+                try:
+                    result = flowchart_from_image_api(api_base, img_base64, prefer_multimodal)
+                    st.session_state.flowchart_mermaid = result.get("mermaid", "")
+                    st.session_state.flowchart_source = result.get("source", "")
+                    st.session_state.flowchart_error = result.get("error")
+                except RequestException as e:
+                    st.session_state.flowchart_mermaid = ""
+                    st.session_state.flowchart_error = _handle_api_error(e)
+
+    else:
+        # ── 文本输入 ──
+        flowchart_text = st.text_area(
+            "输入法规文本",
+            placeholder="粘贴包含流程/步骤描述的法规文本，例如审批流程、备案程序等...",
+            height=200,
+            key="flowchart_text_input",
+        )
+
+        generate_btn_text = st.button(
+            "生成流程图",
+            type="primary",
+            disabled=not st.session_state.api_ok or not flowchart_text.strip(),
+            key="flowchart_generate_btn_text",
+        )
+
+        if generate_btn_text and flowchart_text.strip():
+            with st.spinner("正在从文本生成流程图..."):
+                try:
+                    result = flowchart_from_text_api(api_base, flowchart_text.strip())
+                    st.session_state.flowchart_mermaid = result.get("mermaid", "")
+                    st.session_state.flowchart_source = result.get("source", "")
+                    st.session_state.flowchart_error = result.get("error")
+                except RequestException as e:
+                    st.session_state.flowchart_mermaid = ""
+                    st.session_state.flowchart_error = _handle_api_error(e)
+
+    # ── 结果展示 ──
+    mermaid_str = st.session_state.flowchart_mermaid
+    source = st.session_state.flowchart_source
+    error = st.session_state.flowchart_error
+
+    if error:
+        st.warning(f"生成提示: {error}")
+
+    if mermaid_str:
+        # 生成路径标签
+        source_label = {"multimodal": "多模态 LLM", "ocr+llm": "OCR + 文本 LLM", "text": "文本 LLM"}.get(source, source)
+        st.caption(f"生成路径: {source_label}")
+
+        # ── 流程图渲染 ──
+        st.markdown("### 📊 流程图")
+        render_mermaid(mermaid_str, height=600)
+
+        # ── Mermaid 源码（可编辑） ──
+        st.markdown("### 📝 Mermaid 源码（可编辑后重新渲染）")
+        edited_mermaid = st.text_area(
+            "Mermaid 源码",
+            value=mermaid_str,
+            height=300,
+            key="flowchart_mermaid_editor",
+        )
+
+        if edited_mermaid != mermaid_str and edited_mermaid.strip():
+            st.session_state.flowchart_mermaid = edited_mermaid.strip()
+            st.markdown("### 📊 修改后流程图")
+            render_mermaid(edited_mermaid.strip(), height=600)
+
+        # ── 导出 ──
+        st.download_button(
+            "下载 Mermaid 源码",
+            data=mermaid_str,
+            file_name="flowchart.mmd",
+            mime="text/plain",
+            key="flowchart_download_btn",
+        )
+    elif not error:
+        st.info("请上传图片或输入文本，点击「生成流程图」开始")

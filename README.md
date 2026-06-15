@@ -25,6 +25,7 @@ app.py (Streamlit HTTP 客户端)
      -> TermIndex
      -> FinanceDictionary
      -> KnowledgeGraph (optional)
+     -> FlowchartGenerator (图片/文本 → Mermaid 流程图)
      -> RAGChain.query()
         -> 实体检测
         -> 查询扩展
@@ -54,6 +55,8 @@ app.py (Streamlit HTTP 客户端)
 | `DELETE` | `/api/categories/{name}` | 删除词典分类 |
 | `GET` | `/api/dictionary/{item_type}` | 列出词典条目（law/authority/term/abbreviation） |
 | `PUT` | `/api/dictionary/{item_name}/category` | 设置词典条目分类 |
+| `POST` | `/api/flowchart/image` | 图片 → Mermaid 流程图（多模态 LLM / OCR+文本 LLM） |
+| `POST` | `/api/flowchart/text` | 法规文本 → Mermaid 流程图 |
 
 ## 主要能力
 
@@ -70,6 +73,7 @@ app.py (Streamlit HTTP 客户端)
 - SSE 流式问答输出（token 级别实时推送）
 - 查询重写器 LoRA 微调训练管线
 - 法规 `effective_date` / `status` 时效性过滤
+- 图片/文本 → Mermaid 流程图生成（多模态 LLM + OCR 双路径，含源码可编辑与导出）
 - Streamlit 前端与 FastAPI 后端分离
 
 ## 技术栈
@@ -87,6 +91,7 @@ app.py (Streamlit HTTP 客户端)
 | OCR | PaddleOCR + Docling 双后端（PDF 文本层不足时自动回退）；独立图片文件 OCR；低分辨率图片基础预处理增强 |
 | LLM | 本地 Qwen / DeepSeek API / 通义千问 API |
 | 流式输出 | FastAPI SSE (Server-Sent Events)，token 级别实时推送 |
+| 流程图 | Mermaid.js (CDN 前端渲染)，QwenVL 多模态理解，PaddleOCR/Docling 文本提取 |
 
 ## 目录结构
 
@@ -135,6 +140,7 @@ app.py (Streamlit HTTP 客户端)
     │   ├── rag_chain.py
     │   ├── llm.py
     │   ├── rewriter.py
+│   ├── flowchart_generator.py      # 图片/文本 → Mermaid 流程图
     │   └── txt_files/              # 83 部金融法律 txt 语料
     └── tools/
         ├── convert_testfiles.py
@@ -284,6 +290,19 @@ py -3 build_index_bulk.py
 - 低分辨率图片基础预处理（仅 PaddleOCR 后端）：灰度化 + 对比度增强 (1.5×) + 锐化 (1.2×)
 - 通过 `IMAGE_PREPROCESS` 环境变量控制：`auto`（仅低分辨率触发）/ `always` / `never`
 - 也可通过 `OCR_BACKEND=none` 完全禁用 OCR
+
+### 流程图生成
+
+系统支持从图片或法规文本中自动识别流程步骤并生成 Mermaid 流程图，可用于审批流程、备案程序、合规检查等场景的可视化：
+
+- **双路径架构**：
+  - 路径 A（首选）：多模态 LLM（QwenVL）直接理解图片中的流程结构（步骤框、箭头、条件分支），生成 Mermaid 语法
+  - 路径 B（回退）：PaddleOCR/Docling 提取文本 → 文本 LLM 推理流程步骤 → 生成 Mermaid 语法
+- **入口一**：侧边栏图片上传 → 勾选"同时生成流程图"复选框 → 索引完成后自动渲染流程图
+- **入口二**：Streamlit "🔄 流程图生成" Tab，支持图片上传和文本输入两种方式（无需建立索引）
+- **Mermaid 源码可编辑**：生成后可在线修改源码并实时重新渲染
+- **导出**：支持下载 `.mmd` 源码文件
+- 多模态 LLM 不可用时自动回退 OCR + 文本 LLM 路径，无需手动切换
 
 ### 词典自动抽取
 

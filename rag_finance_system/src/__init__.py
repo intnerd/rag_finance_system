@@ -11,6 +11,7 @@ __all__ = [
     "QwenAPILLM",
     "RAGChain",
     "TermIndex",
+    "FlowchartGenerator",
 ]
 
 
@@ -43,6 +44,10 @@ def __getattr__(name):
         from .term_index import TermIndex
 
         return TermIndex
+    if name == "FlowchartGenerator":
+        from .flowchart_generator import FlowchartGenerator
+
+        return FlowchartGenerator
     if name == "VectorStore":
         from .vector_store import VectorStore
 

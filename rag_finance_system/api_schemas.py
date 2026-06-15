@@ -178,3 +178,23 @@ class SetCategoryRequest(BaseModel):
     item_type: str = Field(..., pattern=r"^(term|law|authority)$")
     item_name: str = Field(..., min_length=1)
     category: str
+
+
+# ── Flowchart ──
+
+class FlowchartImageRequest(BaseModel):
+    image_base64: str = Field(..., min_length=1, description="图片 base64 编码")
+    prefer_multimodal: bool = Field(default=True, description="优先使用多模态路径")
+
+
+class FlowchartTextRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="法规文本，用于生成流程图")
+
+
+class FlowchartResponse(BaseModel):
+    mermaid: str = Field(default="", description="Mermaid 流程图语法")
+    source: str = Field(default="", description="生成路径: multimodal / ocr+llm / text")
+    raw_text: str = Field(default="", description="LLM 原始输出")
+    ocr_text: Optional[str] = Field(default=None, description="OCR 提取的文本（仅 OCR 路径）")
+    success: bool = Field(default=False)
+    error: Optional[str] = Field(default=None)
