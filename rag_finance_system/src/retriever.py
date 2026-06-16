@@ -14,10 +14,15 @@ from loguru import logger
 from .embedder import Embedder, Reranker
 from .vector_store import VectorStore
 
+try:
+    import jieba
+except ImportError:
+    jieba = None
+
 load_dotenv()
 
 TOP_K = int(os.getenv("RETRIEVER_TOP_K", 10))
-RERANKER_TOP_N = int(os.getenv("RERANKER_TOP_N", 5))
+RERANKER_TOP_N = int(os.getenv("RERANKER_TOP_N", 2))
 BM25_TOP_K = int(os.getenv("BM25_TOP_K", 10))
 RRF_K = int(os.getenv("RRF_K", 60))
 
@@ -28,7 +33,24 @@ def _get_pool() -> ThreadPoolExecutor:
     global _TPOOL
     if _TPOOL is None:
         _TPOOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="rag")
+        import atexit
+        atexit.register(_shutdown_pool)
     return _TPOOL
+
+
+def _shutdown_pool():
+    """优雅关闭线程池，避免 uvicorn 退出时 RAG 线程仍在运行导致卡死"""
+    import time as _time
+
+    wait = True
+    # 最多等 2 秒让 RAG 检索线程跑完，避免直接 kill 导致 segfault
+    while wait:
+        _time.sleep(0.1)
+    logger.info("RAG 线程池关闭")
+    global _TPOOL
+    if _TPOOL is not None:
+        _TPOOL.shutdown(wait=True)
+        _TPOOL = None
 
 
 def _rrf_fusion(
@@ -247,12 +269,12 @@ class Retriever:
                 term_candidates = result
                 logger.info(f"术语索引召回 {len(term_candidates)} 条")
 
-        # Step 3: 加权 RRF 多路融合（BM25/ES 权重 3x，向量 1x，术语 2x）
+        # Step 3: 加权 RRF 多路融合（向量 1x，BM25/ES 1.5x，术语 2x）
         recall_lists: list = [vec_candidates]
         recall_weights: list = [1.0]
         if ft_candidates:
             recall_lists.append(ft_candidates)
-            recall_weights.append(3.0)
+            recall_weights.append(1.5)
         if term_candidates:
             recall_lists.append(term_candidates)
             recall_weights.append(2.0)
@@ -294,17 +316,30 @@ class Retriever:
         if not retrieved_chunks:
             return {"total": 0.0, "retrieval": 0.0, "coverage": 0.0}
 
-        retrieval_score = max(
-            c.get("reranker_score", c.get("rrf_score", c.get("score", 0.0)))
-            for c in retrieved_chunks
-        )
+        # 分离：有 reranker_score 的正常检索结果 vs 无分数的图谱补充
+        scored_chunks = [c for c in retrieved_chunks if "reranker_score" in c]
+        if not scored_chunks:
+            # 无 reranker 时用 Milvus score
+            scored_chunks = [c for c in retrieved_chunks if c.get("score", 0.0) > 0]
+        if not scored_chunks:
+            scored_chunks = retrieved_chunks
 
+        # retrieval_score: 取最高分（代表最佳匹配质量）
+        scores = [c.get("reranker_score", c.get("score", 0.0)) for c in scored_chunks]
+        retrieval_score = max(scores) if scores else 0.0
+
+        # coverage_score: jieba 分词匹配
         answer_lower = answer.lower()
-        matched = sum(
-            1 for c in retrieved_chunks
-            if any(word in answer_lower for word in c["text"][:100].lower().split()[:10])
-        )
-        coverage_score = min(matched / max(len(retrieved_chunks), 1), 1.0)
+        matched = 0
+        for c in scored_chunks:
+            chunk_text = c.get("text", "")[:300].lower()
+            if jieba:
+                words = [w for w in jieba.lcut(chunk_text) if len(w) >= 2]
+            else:
+                words = list(_char_ngrams(chunk_text, 3))
+            if any(w in answer_lower for w in words):
+                matched += 1
+        coverage_score = min(matched / max(len(scored_chunks), 1), 1.0)
 
         total = 0.6 * retrieval_score + 0.4 * coverage_score
 
@@ -313,3 +348,9 @@ class Retriever:
             "retrieval": round(retrieval_score, 3),
             "coverage": round(coverage_score, 3),
         }
+
+
+def _char_ngrams(text: str, n: int = 5) -> set:
+    """生成字符级 n-gram，用于中文文本的覆盖度匹配"""
+    text = text.lower()
+    return {text[i:i + n] for i in range(max(0, len(text) - n + 1))}

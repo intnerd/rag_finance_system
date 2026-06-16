@@ -23,40 +23,40 @@
         └──────────────────────────────────────────┘
 ```
 
-## 核心功能
+## 功能
 
-| 模块 | 功能 | 技术要点 |
-|------|------|---------|
-| **三轨文档分段** | 按文档类型自适配切分策略 | law：强制按"第X条"；case：段落结构；other：第X条→一、二、三→递归 |
-| **元数据自动提取** | 自动标注四维结构化标签 | law_name、authority、effective_date、status，全从文件名解析 |
-| **实体检测** | 从口语问题中识别文件/法律/机构 | 金融词典(500+别名) + 文件扫描索引 + 公文规则，四层回退 |
-| **查询重写** | 口语转检索语 | Qwen2.5-0.5B + LoRA 微调（600条数据），三级降级保障 |
-| **三路并行检索** | 向量 + BM25 + 术语索引并发检索 | ThreadPoolExecutor，取最长耗时而非累加 |
-| **加权 RRF 融合** | 多路召回融合 | BM25 权重 3×（金融术语精确匹配优先） |
-| **流式 SSE 输出** | Token-by-token 生成 | TextIteratorStreamer + 后台线程 + `/api/qa/stream` |
-| **检索过滤软回退** | 精确过滤0召回时自动降级 | source→查询增强，authority/status 过滤失败自动去掉 |
-| **多版本自动管理** | 同名法规按日期判定有效/已修订 | 检索默认只看最新版本 |
-| **文档 OCR** | 扫描件 PDF 文本提取 | docling 后端，2.0x 缩放提升中文识别率 |
+- **多类型文档解析**：支持法条 (law)、案例 (case)、其他参考资料 (other) 三种类型，PDF / TXT 格式
+- **智能分段策略**：
+  - 法条：按"第XX条"结构切分，条文内部递归切分，永不跨条
+  - 案例：按裁判文书标准段落结构切分
+  - 其他：三级优先级切分（第X条 → 中文序号 一、二、三… → 纯递归）
+- **实体感知检索**：从用户问题中自动识别文件名（《》内法规简称）、法律名称（公司法→中华人民共和国公司法）、监管机构（上海→上海银保监局），多过滤器 OR 组合检索
+- **元数据增强**：每个 chunk 自动提取法律名称 (law_name) 和发布机构 (authority)，支持精确过滤
+- **查询重写**：优先使用 Qwen2.5-0.5B + LoRA 微调模型，失败回退主 LLM；支持侧边栏开关
+- **四种检索模式**：全部 / 仅法条 / 仅案例 / 仅其他
+- **答案溯源**：每条回答附带来源文件、条文编号和相关度评分（绿/橙/红三色标识）
+- **可信度评分**：综合检索相关性（60%）与答案覆盖度（40%）
+- **多 LLM 后端**：本地 Qwen2.5-7B-Int4 / DeepSeek API / 通义千问 API，自动降级
+- **对话历史**：MySQL 持久化存储所有对话记录，支持查看、切换、删除
+- **收藏功能**：收藏整个对话或单条溯源条文，支持查看和取消收藏
+- **Docker 一键部署**：Docker Compose 编排 7 个服务（Milvus + MySQL + Neo4j + etcd + MinIO + API + 前端），GPU 支持
+- **批量导入**：支持一键导入 testfiles 中的 148 份监管规范性文件
 
 ## 技术栈
 
-| 组件 | 方案 | 备注 |
-|------|------|------|
-| 前端 | Streamlit | 三类型独立上传、多文件选择、流式逐字渲染 |
-| API 层 | FastAPI + Uvicorn | 6 个 REST 端点 + SSE 流式 |
-| Embedding | bge-small-zh-v1.5 (512d) | BGE 指令前缀（查询编码加前缀） |
-| Reranker | bge-reranker-v2-m3 | Cross-Encoder + Sigmoid + FP16 + Warmup |
-| 向量数据库 | Milvus (pymilvus + milvus-lite) | AUTOINDEX / COSINE，嵌入式本地部署 |
-| 关键词检索 | 内存 BM25 | jieba 中文分词，k1=1.5, b=0.75 |
-| 全文检索 | Elasticsearch 8.x（可选） | IK 中文分词器，不可用时自动回退 BM25 |
-| 术语索引 | 自研倒排索引 | 基于金融词典的精确术语匹配 |
-| 查询重写 | Qwen2.5-0.5B-Instruct + LoRA | GPU/CPU 均可，<100ms |
-| LLM | Qwen2.5-7B-Instruct-GPTQ-Int4 (5.3GB) | 本地 GPU 优先 → DeepSeek API → 通义千问 |
-| 金融词典 | 76术语 + 55法律 + 29机构 + 500+别名 | JSON 格式，最长子串优先匹配 |
-| 知识图谱 | Neo4j（可选） | 4节点3边类型，纯规则构建，不可用静默跳过 |
-| 对话历史 | MySQL + SQLAlchemy（可选） | conversations / messages / favorites 三表 |
-| OCR | docling（可选） | 自动激活（文本层<80字符或空白页>50%） |
-| 文档解析 | pdfplumber + 自研分段器 | 支持 PDF / TXT |
+| 组件 | 方案 |
+|------|------|
+| 前端 | Streamlit |
+| 后端 | FastAPI (Uvicorn) |
+| Embedding | bge-small-zh-v1.5 (512d) |
+| Reranker | bge-reranker-v2-m3 (Cross-Encoder + Sigmoid) |
+| 查询重写 | Qwen2.5-0.5B-Instruct + LoRA |
+| 向量数据库 | Milvus (本地/自建服务) |
+| 关系数据库 | MySQL 8.0 (对话历史/收藏) |
+| 知识图谱 | Neo4j 5-Community (条文引用关系/法规关联) |
+| LLM | Qwen2.5-7B-Instruct-GPTQ-Int4 / DeepSeek / 通义千问 |
+| 文档解析 | pdfplumber (PDF) + 自研分段器 |
+| 容器化 | Docker Compose + NVIDIA GPU |
 
 ## 项目结构
 
@@ -65,16 +65,31 @@ rag_finance_system/
 ├── README.md
 ├── LOCAL_DEVELOPMENT.md          # 本地开发功能详细文档
 ├── requirements.txt
-├── docker-compose.yml            # Milvus + ES + Neo4j + MySQL
-├── Dockerfile
-├── checkpoints/rewriter_lora/    # 查询重写 LoRA 权重
+├── .gitignore
+├── .dockerignore
+├── Dockerfile                       # Docker 镜像定义 (CUDA + GPU)
+├── docker-compose.yml               # 一键部署 7 个服务
+├── checkpoints/
+│   └── rewriter_lora/               # 查询重写器 LoRA 微调权重
+│       ├── checkpoint-136/
+│       ├── checkpoint-340/
+│       └── final/                   # 最终版权重
+├── docker/
+│   └── requirements-docker.txt      # Docker 精简依赖 (31 个包)
+├── scripts/
+│   └── docker-entrypoint.sh         # Docker 启动脚本
 ├── data/
-│   ├── finance_dictionary.json   # 金融词典
-│   ├── dictionary_candidates.json
-│   ├── questions.json             # 600条测试问答对
-│   ├── raw/                      # 上传文档存储
-│   └── testfiles/                # 148份地方规范性文件
-├── db/milvus_finance.db/         # Milvus Lite 本地数据库
+│   ├── finance_dictionary.json      # 金融词典 (术语/法规名/机构名)
+│   ├── bm25_index.pkl               # BM25 持久化索引
+│   ├── questions.json               # 600 条测试问答对
+│   ├── raw/                         # 上传文档存储
+│   │   ├── law/                     # 法条原文
+│   │   ├── case/                    # 案例原文
+│   │   └── other/                   # 其他参考资料
+│   └── testfiles/                   # 148 份地方监管规范性文件
+│       ├── 上海监管局/
+│       ├── 江苏监管局/
+│       └── 浙江监管局/
 ├── rag_finance_system/
 │   ├── .env                      # 本地配置（不纳入版本控制）
 │   ├── .env.example              # 配置模板
@@ -122,16 +137,64 @@ pip install -r requirements.txt
 
 将以下模型放入 `models/` 目录（或任意路径，在 `.env` 中配置）：
 
-- Embedding: `BAAI/bge-small-zh-v1.5`
-- Reranker: `BAAI/bge-reranker-v2-m3`
-- LLM: `Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4`
-- Rewriter: `Qwen/Qwen2.5-0.5B-Instruct`（自动从 HuggingFace 下载）
+```bash
+# 模型路径
+EMBEDDING_MODEL_PATH=./models/bge-small-zh-v1.5
+RERANKER_MODEL_PATH=./models/bge-reranker-v2-m3
+LLM_MODEL_PATH=./models/Qwen2.5-7B-Int4
+
+# API 密钥（本地模型不可用时自动切换）
+DEEPSEEK_API_KEY=sk-xxx
+DASHSCOPE_API_KEY=xxx
+
+# Milvus 连接配置（本地/自建服务）
+MILVUS_HOST=127.0.0.1
+MILVUS_PORT=19530
+MILVUS_COLLECTION_NAME=finance_regulations
+MILVUS_EMBED_DIM=512
+
+# Neo4j 知识图谱配置（条文引用关系 / Docker 端口 17687→7687）
+NEO4J_URI=bolt://localhost:17687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=neo4j
+NEO4J_DATABASE=neo4j
+
+# MySQL 连接配置（对话历史/收藏）
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=rag_user
+MYSQL_PASSWORD=rag123456
+MYSQL_DATABASE=rag_finance
+
+# 检索参数
+RETRIEVER_TOP_K=10      # 向量检索召回数量
+RERANKER_TOP_N=5        # Reranker 后保留数量
+CHUNK_SIZE=512          # 分段字符数
+CHUNK_OVERLAP=100       # 分段重叠字符数
+```
+
+## 使用
 
 ### 配置
 
 ```bash
-cp rag_finance_system/.env.example rag_finance_system/.env
-# 编辑 .env 配置模型路径和 API 密钥
+# 安装依赖
+pip install -r requirements.txt
+
+# 启动 Milvus（需要 docker）
+docker compose up -d milvus etcd minio
+
+# 启动 MySQL（需要 docker）
+docker compose up -d mysql
+
+# 启动 Milvus + MySQL + Neo4j（需要 docker）
+docker compose up -d milvus mysql neo4j
+
+# 启动 FastAPI 后端（Windows 端口 8000 被保留时使用 9099）
+uvicorn rag_finance_system.api_app:app --host 0.0.0.0 --port 9099
+
+# 启动 Streamlit 前端
+streamlit run rag_finance_system/app.py
 ```
 
 ### 导入文档
@@ -144,7 +207,25 @@ cp rag_finance_system/.env.example rag_finance_system/.env
 python rag_finance_system/tools/import_testfiles.py
 ```
 
-### 启动
+启动后访问：
+- **Streamlit 前端**: http://localhost:8501
+- **Neo4j Browser** (图谱可视化): http://localhost:7474
+- **MinIO 控制台**: http://localhost:9001
+
+### 前端操作流程
+
+1. **上传文档**：侧边栏三个独立上传区分别对应法条、案例、其他资料
+2. **建立索引**：点击对应"解析并建立索引"按钮
+3. **选择模式**：全部 / 仅法条 / 仅案例 / 仅其他
+4. **提问**：输入自然语言问题，系统自动进行实体检测和查询重写
+5. **查看结果**：答案附带溯源条文（可展开）和可信度评分
+6. **对话历史**：侧边栏显示历史对话列表，点击切换查看
+7. **收藏功能**：对话中可收藏整个对话或单条溯源条文
+8. **条文关联查询**（Tab 2）：输入法规名称和条文编号，查看引用关系网络（基于 Neo4j 知识图谱，Neo4j 不可用时降级为 Milvus 文本匹配）
+9. **标签分类管理**（Tab 3）：管理金融词典中术语、法规和机构的分类标签
+10. **侧边栏选项**：可切换 API 模式、开关 Reranker、开关查询重写
+
+### 命令行工具
 
 ```bash
 # 终端 1 — 后端
@@ -192,4 +273,9 @@ docker compose up -d
 
 ## License
 
-MIT
+- ✅ FastAPI 后端 + Streamlit 前端
+- ✅ MySQL 对话历史 + 收藏功能
+- ✅ Docker Compose 一键部署 (GPU + Qwen2.5-7B-Int4)
+- ✅ Elasticsearch BM25 倒排索引 + 混合检索 (RRF 融合)
+- ✅ Neo4j 知识图谱（条文引用关系网络 + 条文关联查询）
+- OCR 增强管线（扫描件支持）
